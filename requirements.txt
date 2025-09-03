@@ -1,5 +1,7 @@
 fastapi
-pydantic
-requests
-google-auth
 uvicorn
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+requests
+pydantic

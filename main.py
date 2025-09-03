@@ -1,21 +1,45 @@
+# main.py - Simple Single URL Google Indexing API
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from google.oauth2 import service_account
 import google.auth.transport.requests
 import requests
 import json
-from typing import Optional
 import os
+from typing import Optional, Dict, Any
+import base64
+import time
 
-app = FastAPI(title="Google Indexing API", description="Submit URLs to Google for indexing")
+app = FastAPI(
+    title="Google Indexing API - Single URL",
+    description="Submit single URL to Google for indexing",
+    version="1.0.0"
+)
 
 # Configuration
-SERVICE_ACCOUNT_FILE = 'service-account.json'
-SCOPES = ['https://www.googleapis.com/auth/indexing']
+DEFAULT_SCOPES = ['https://www.googleapis.com/auth/indexing']
+TIMEOUT = 30
+API_ENDPOINT = 'https://indexing.googleapis.com/v3/urlNotifications:publish'
+MAX_RETRIES = 3
+
+class ServiceAccountModel(BaseModel):
+    type: str
+    project_id: str
+    private_key_id: str
+    private_key: str
+    client_email: str
+    client_id: str
+    auth_uri: str
+    token_uri: str
+    auth_provider_x509_cert_url: Optional[str] = None
+    client_x509_cert_url: Optional[str] = None
 
 class URLRequest(BaseModel):
     url: HttpUrl
-    type: Optional[str] = "URL_UPDATED"  # URL_UPDATED or URL_DELETED
+    type: Optional[str] = "URL_UPDATED"
+    service_account: Optional[ServiceAccountModel] = None
+    project_id: Optional[str] = None
+    scopes: Optional[list[str]] = None
 
 class URLResponse(BaseModel):
     success: bool
@@ -24,48 +48,115 @@ class URLResponse(BaseModel):
     url: str
     type: str
 
-def get_access_token():
-    """Get Google API access token using service account."""
+def fix_private_key_format(private_key: str) -> str:
+    """Fix private key format issues."""
+    if not private_key:
+        return private_key
+    
+    if '\\n' in private_key and '\n' not in private_key:
+        return private_key.replace('\\n', '\n')
+    
+    return private_key
+
+def get_service_account_info(service_account_data: Optional[ServiceAccountModel] = None):
+    """Get service account info."""
     try:
-        if not os.path.exists(SERVICE_ACCOUNT_FILE):
-            raise FileNotFoundError(f"Service account file '{SERVICE_ACCOUNT_FILE}' not found")
+        # Use provided service account
+        if service_account_data:
+            data = service_account_data.dict()
+            if 'private_key' in data:
+                data['private_key'] = fix_private_key_format(data['private_key'])
+            return data
         
-        creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        # Environment variable
+        env_service_account_base64 = os.getenv('GOOGLE_SERVICE_ACCOUNT_BASE64')
+        if env_service_account_base64:
+            service_account_json = base64.b64decode(env_service_account_base64).decode('utf-8')
+            data = json.loads(service_account_json)
+            
+            if 'private_key' in data:
+                data['private_key'] = fix_private_key_format(data['private_key'])
+            
+            return data
         
-        # Refresh to obtain access_token
-        request = google.auth.transport.requests.Request()
-        creds.refresh(request)
-        return creds.token
+        # File
+        service_account_file = os.getenv('SERVICE_ACCOUNT_FILE', 'service-account.json')
+        if os.path.exists(service_account_file):
+            with open(service_account_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+                if 'private_key' in data:
+                    data['private_key'] = fix_private_key_format(data['private_key'])
+                
+                return data
+        
+        raise FileNotFoundError("Service account credentials not found")
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get access token: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to load service account: {str(e)}")
 
 @app.post("/submit-url", response_model=URLResponse)
 async def submit_url(request: URLRequest):
-    """Submit a URL to Google Indexing API."""
+    """Submit a single URL to Google Indexing API."""
     try:
-        # Get access token
-        access_token = get_access_token()
+        # Get service account
+        service_account_info = get_service_account_info(request.service_account)
         
-        # Prepare the request
+        # Use provided scopes or default
+        token_scopes = request.scopes if request.scopes else DEFAULT_SCOPES
+        
+        # Validate required fields
+        required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email']
+        missing_fields = [field for field in required_fields if field not in service_account_info]
+        
+        if missing_fields:
+            raise ValueError(f"Missing required fields: {missing_fields}")
+        
+        # Get access token with retry
+        access_token = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                creds = service_account.Credentials.from_service_account_info(
+                    service_account_info, scopes=token_scopes)
+                
+                if attempt > 0:
+                    time.sleep(1)
+                
+                auth_request = google.auth.transport.requests.Request()
+                creds.refresh(auth_request)
+                access_token = creds.token
+                break
+                
+            except Exception as e:
+                if "Invalid JWT Signature" in str(e) and attempt < MAX_RETRIES - 1:
+                    continue
+                else:
+                    raise e
+        
+        # Prepare request
+        project_id = request.project_id or service_account_info.get('project_id')
+        
         headers = {
             'Authorization': f'Bearer {access_token}',
             'Content-Type': 'application/json'
         }
+        
+        if project_id:
+            headers['X-Goog-User-Project'] = project_id
         
         payload = {
             'url': str(request.url),
             'type': request.type
         }
         
-        # Make the API call
+        # Submit to Google
         response = requests.post(
-            'https://indexing.googleapis.com/v3/urlNotifications:publish',
+            API_ENDPOINT,
             headers=headers,
-            json=payload
+            json=payload,
+            timeout=TIMEOUT
         )
         
-        # Parse response
         success = response.status_code == 200
         
         return URLResponse(
@@ -76,100 +167,12 @@ async def submit_url(request: URLRequest):
             type=request.type
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to submit URL: {str(e)}")
 
-@app.post("/submit-urls", response_model=list[URLResponse])
-async def submit_multiple_urls(requests_list: list[URLRequest]):
-    """Submit multiple URLs to Google Indexing API."""
-    results = []
-    
-    try:
-        # Get access token once for all requests
-        access_token = get_access_token()
-        
-        headers = {
-            'Authorization': f'Bearer {access_token}',
-            'Content-Type': 'application/json'
-        }
-        
-        for url_request in requests_list:
-            try:
-                payload = {
-                    'url': str(url_request.url),
-                    'type': url_request.type
-                }
-                
-                response = requests.post(
-                    'https://indexing.googleapis.com/v3/urlNotifications:publish',
-                    headers=headers,
-                    json=payload
-                )
-                
-                success = response.status_code == 200
-                
-                results.append(URLResponse(
-                    success=success,
-                    status_code=response.status_code,
-                    message=response.text if not success else "URL submitted successfully",
-                    url=str(url_request.url),
-                    type=url_request.type
-                ))
-                
-            except Exception as e:
-                results.append(URLResponse(
-                    success=False,
-                    status_code=500,
-                    message=f"Error: {str(e)}",
-                    url=str(url_request.url),
-                    type=url_request.type
-                ))
-        
-        return results
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process URLs: {str(e)}")
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "google-indexing-api"}
-
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "Google Indexing API Service",
-        "endpoints": {
-            "submit_single": "/submit-url",
-            "submit_multiple": "/submit-urls",
-            "health": "/health",
-            "docs": "/docs"
-        }
-    }
-
-# Example usage information
-@app.get("/example")
-async def example_usage():
-    """Show example usage."""
-    return {
-        "single_url_example": {
-            "url": "https://example.com/page",
-            "type": "URL_UPDATED"
-        },
-        "multiple_urls_example": [
-            {
-                "url": "https://example.com/page1",
-                "type": "URL_UPDATED"
-            },
-            {
-                "url": "https://example.com/page2", 
-                "type": "URL_DELETED"
-            }
-        ],
-        "curl_example": 'curl -X POST "http://localhost:8000/submit-url" -H "Content-Type: application/json" -d \'{"url": "https://example.com", "type": "URL_UPDATED"}\''
-    }
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
